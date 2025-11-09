@@ -7,11 +7,7 @@ import numpy as np
 
 class CalibrationWizard:
     """
-    Simple & Advanced calibration:
-      - Env checks (lighting, background clutter, resolution, hand size)
-      - Auto-tune skin HSV from ROI
-      - Tune recognizer stability (window / conf) from observed confidence
-      - NOW WITH GUIDE BOX!
+    Enhanced calibration with SIMILARITY SCORES showing how close you are!
     """
 
     def __init__(self, cap, hand_detector, recognizer, resources_path):
@@ -92,6 +88,56 @@ class CalibrationWizard:
         cv2.putText(frame, text, (text_x, text_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
 
+    def _draw_similarity_meter(self, frame, target_letter, current_conf, all_scores):
+        """Draw similarity meter showing how close you are to target"""
+        h, w = frame.shape[:2]
+
+        # Position on left side
+        x_start = 12
+        y_start = 200
+        bar_width = 250
+        bar_height = 25
+
+        # Title
+        cv2.putText(frame, f"Target: {target_letter}", (x_start, y_start - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 255), 2)
+
+        # Similarity bar for TARGET letter
+        target_score = all_scores.get(target_letter, 0.0)
+        cv2.rectangle(frame, (x_start, y_start), (x_start + bar_width, y_start + bar_height),
+                      (60, 60, 60), -1)
+
+        fill_width = int(bar_width * target_score)
+        if target_score > 0.7:
+            color = (0, 255, 0)  # Green - very close!
+        elif target_score > 0.5:
+            color = (0, 165, 255)  # Orange - getting there
+        else:
+            color = (0, 0, 255)  # Red - not close
+
+        cv2.rectangle(frame, (x_start, y_start), (x_start + fill_width, y_start + bar_height),
+                      color, -1)
+        cv2.rectangle(frame, (x_start, y_start), (x_start + bar_width, y_start + bar_height),
+                      (255, 255, 255), 2)
+
+        # Percentage text
+        cv2.putText(frame, f"{int(target_score * 100)}% match",
+                    (x_start + bar_width + 10, y_start + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Show top 3 closest letters
+        y_offset = y_start + bar_height + 40
+        cv2.putText(frame, "Closest letters:", (x_start, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        y_offset += 25
+
+        sorted_scores = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)[:3]
+        for i, (letter, score) in enumerate(sorted_scores):
+            color = (0, 255, 0) if letter == target_letter else (180, 180, 180)
+            text = f"{i + 1}. {letter}: {score:.2f}"
+            cv2.putText(frame, text, (x_start, y_offset + i * 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2 if letter == target_letter else 1)
+
     # ---------- Simple ----------
     def run_simple(self, target_letter="A", conf_thresh=0.50):
         # Enable guide box for calibration
@@ -109,20 +155,42 @@ class CalibrationWizard:
             # Draw guide box
             self._draw_calibration_guide_box(frame, hand)
 
-            # Environment hints (moved down to avoid overlap with box)
-            env_msgs = self._env_msgs(frame, hand)
-            self._hints_below_box(frame, env_msgs)
-
             passed = False
+            all_scores = {}
+
             if hand:
+                # Get prediction with scores for ALL letters
                 letter, conf, _, _ = self.rec.predict(hand["roi"], hand["roi_mask"])
-                cv2.putText(frame, f"Pred: {letter or '-'} ({conf:.2f})",
+
+                # Get detailed scores (we need to expose this from recognizer)
+                gray = cv2.cvtColor(hand["roi"], cv2.COLOR_BGR2GRAY)
+                mask = hand["roi_mask"]
+
+                # Extract features
+                query_geometric = self.rec._extract_geometric_features(mask)
+
+                if query_geometric:
+                    # Calculate scores for ALL references
+                    for label, data in self.rec.refs.items():
+                        geo_score = self.rec._compare_geometric_features(query_geometric, data["geometric"])
+                        all_scores[label] = geo_score
+
+                # Draw similarity meter
+                self._draw_similarity_meter(frame, target_letter, conf, all_scores)
+
+                # Display current prediction
+                cv2.putText(frame, f"Detected: {letter or '-'} ({conf:.2f})",
                             (12, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
                 if letter == target_letter and conf >= conf_thresh:
                     passed = True
 
+            # Environment hints
+            env_msgs = self._env_msgs(frame, hand)
+            self._hints_below_box(frame, env_msgs)
+
             if passed:
-                cv2.putText(frame, "Success! Press SPACE to continue", (12, 160),
+                cv2.putText(frame, "SUCCESS! Press SPACE to continue", (12, 160),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             else:
                 cv2.putText(frame, "Try again... (S=Skip, Q=Quit)", (12, 160),
@@ -167,20 +235,37 @@ class CalibrationWizard:
                 # Draw guide box
                 self._draw_calibration_guide_box(frame, hand)
 
-                # Environment hints below box
-                env_msgs = self._env_msgs(frame, hand)
-                self._hints_below_box(frame, env_msgs)
+                all_scores = {}
 
                 if hand:
                     letter, conf, _, _ = self.rec.predict(hand["roi"], hand["roi_mask"])
-                    cv2.putText(frame, f"Pred: {letter or '-'} ({conf:.2f})",
+
+                    # Get detailed scores
+                    gray = cv2.cvtColor(hand["roi"], cv2.COLOR_BGR2GRAY)
+                    mask = hand["roi_mask"]
+                    query_geometric = self.rec._extract_geometric_features(mask)
+
+                    if query_geometric:
+                        for label, data in self.rec.refs.items():
+                            geo_score = self.rec._compare_geometric_features(query_geometric, data["geometric"])
+                            all_scores[label] = geo_score
+
+                    # Draw similarity meter
+                    self._draw_similarity_meter(frame, L, conf, all_scores)
+
+                    cv2.putText(frame, f"Detected: {letter or '-'} ({conf:.2f})",
                                 (12, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
                     if letter == L and conf >= base_conf:
                         streak += 1
                         conf_sum += conf
                         self.hd.calibrate_from_roi(hand["roi"], hand["roi_mask"])
                     else:
                         streak, conf_sum = 0, 0.0
+
+                # Environment hints below box
+                env_msgs = self._env_msgs(frame, hand)
+                self._hints_below_box(frame, env_msgs)
 
                 cv2.putText(frame, f"{streak}/{consec} correct   S=Skip  R=Retry  Q=Quit",
                             (12, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (180, 255, 180), 2)
@@ -300,11 +385,3 @@ class CalibrationWizard:
         for m in msgs[:3]:
             cv2.putText(frame, m, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 255), 2)
             y += 25
-
-    def _hints(self, frame, msgs):
-        """Original hints placement (kept for compatibility)"""
-        y = 72
-        for m in msgs[:3]:
-            cv2.putText(frame, m, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 255), 2)
-            y += 24
-

@@ -135,13 +135,21 @@ def main():
     no_hand_counter = 0
     MAX_NO_HAND = 150
 
-    # ---- Calibration menu ----
+    # ---- Calibration menu WITH GUIDE BOX ----
     wiz = CalibrationWizard(cap, hd, rec, resources_path=str(REFS))
+    # IMPORTANT: Enable box for startup calibration menu
+    hd.enable_guide_box(True)
+
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         frame = cv2.flip(frame, 1)
+
+        # Draw guide box in calibration menu
+        hand_preview = hd.detect_hand(frame)
+        draw_hand_guide_box(frame, hand_preview)
+
         cv2.putText(frame, "Calibration", (16, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 220, 255), 2)
         cv2.putText(frame, "Press 1: Simple (A)   2: Advanced (A,E,O)   S: Skip",
                     (16, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220, 220, 220), 2)
@@ -188,6 +196,7 @@ def main():
                 if no_hand_counter >= MAX_NO_HAND:
                     print("[Auto-reset] No hand detected for 5s")
                     hd = HandDetector()
+                    hd.enable_guide_box(show_guide_box)  # Restore box state
                     rec.reset_history()
                     no_hand_counter = 0
             else:
@@ -279,6 +288,7 @@ def main():
                 show_help = not show_help
             elif key == ord('g'):
                 show_guide_box = not show_guide_box
+                hd.enable_guide_box(show_guide_box)  # ← FIX: Sync with detector!
                 print(f"Guide box: {'ON' if show_guide_box else 'OFF'}")
             elif key == ord('m'):
                 show_mask = not show_mask
@@ -291,12 +301,16 @@ def main():
                 st = kbd.toggle_active()
                 print(f"Typing {'ENABLED' if st else 'DISABLED'}")
             elif key == ord('k'):
-                # Re-open calibration
+                # Re-open calibration WITH guide box
+                hd.enable_guide_box(True)  # Force enable for calibration
                 while True:
                     ok2, fr2 = cap.read()
                     if not ok2:
                         break
                     fr2 = cv2.flip(fr2, 1)
+                    # Draw guide box in recalibration menu too
+                    hand_preview2 = hd.detect_hand(fr2)
+                    draw_hand_guide_box(fr2, hand_preview2)
                     cv2.putText(fr2, "Calibration", (16, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 220, 255), 2)
                     cv2.putText(fr2, "Press 1: Simple (A)   2: Advanced (A,E,O)   S: Skip",
                                 (16, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220, 220, 220), 2)
@@ -311,6 +325,7 @@ def main():
                         break
                     elif k2 == ord('s'):
                         break
+                hd.enable_guide_box(show_guide_box)
                 try:
                     cv2.destroyWindow("Calibration")
                 except:

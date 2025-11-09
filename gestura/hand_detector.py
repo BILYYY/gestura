@@ -5,7 +5,8 @@ import numpy as np
 class HandDetector:
     """
     HSV skin mask + morphology + largest-contour gating + ROI crop.
-    Includes adaptive skin tuning + auto brightness/contrast adjustment.
+    Includes adaptive skin tuning + auto brightness adjustment.
+    NOW WITH BOX REGION FILTERING - only detects inside guide box!
     """
 
     def __init__(self):
@@ -16,9 +17,24 @@ class HandDetector:
         self.max_area_frac = 0.55  # ≤55% of frame
         self.kernel = np.ones((3, 3), np.uint8)
 
+        # Guide box parameters (same as in run_gestura.py)
+        self.guide_box_size = 280
+        self.guide_box_enabled = True
+
     def set_skin_hsv(self, lower_hsv, upper_hsv):
         self.lower_skin = np.array(lower_hsv, dtype=np.uint8).clip(0, 255)
         self.upper_skin = np.array(upper_hsv, dtype=np.uint8).clip(0, 255)
+
+    def enable_guide_box(self, enabled):
+        """Enable/disable guide box filtering"""
+        self.guide_box_enabled = enabled
+
+    def get_guide_box_coords(self, frame_width, frame_height):
+        """Calculate guide box coordinates"""
+        box_size = self.guide_box_size
+        box_x = frame_width - box_size - 80
+        box_y = (frame_height - box_size) // 2
+        return box_x, box_y, box_x + box_size, box_y + box_size
 
     def calibrate_from_roi(self, roi_bgr, roi_mask, pad_h=10, pad_s=20, pad_v=25):
         """Tighten HSV thresholds from the current user's ROI."""
@@ -56,6 +72,21 @@ class HandDetector:
         enhanced = cv2.merge([l, a, b])
         return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
 
+    def _create_box_mask(self, frame_shape):
+        """Create a mask that only includes the guide box region"""
+        h, w = frame_shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+
+        if self.guide_box_enabled:
+            box_x1, box_y1, box_x2, box_y2 = self.get_guide_box_coords(w, h)
+            # Only allow detection inside the box
+            mask[box_y1:box_y2, box_x1:box_x2] = 255
+        else:
+            # No box restriction - entire frame
+            mask[:, :] = 255
+
+        return mask
+
     # ---- internals ----
     def _skin_mask(self, frame_bgr):
         # Auto-adjust brightness first
@@ -67,6 +98,11 @@ class HandDetector:
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel, iterations=2)
         mask = cv2.GaussianBlur(mask, (5, 5), 0)
         mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+
+        # CRITICAL: Apply box mask to only detect inside guide box
+        box_mask = self._create_box_mask(frame_bgr.shape)
+        mask = cv2.bitwise_and(mask, mask, mask=box_mask)
+
         return mask
 
     def _largest_valid_contour(self, mask, frame_area):

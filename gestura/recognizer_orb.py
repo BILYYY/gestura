@@ -1,7 +1,7 @@
 ﻿import os
 import cv2
 import numpy as np
-from collections import deque
+from collections import deque, Counter
 import math
 
 
@@ -17,8 +17,9 @@ def _resize_pad(img, target=200):
     nh, nw = int(round(h * s)), int(round(w * s))
     r = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
     canvas = np.zeros((target, target), dtype=img.dtype)
-    y0 = (target - nh) // 2; x0 = (target - nw) // 2
-    canvas[y0:y0+nh, x0:x0+nw] = r
+    y0 = (target - nh) // 2
+    x0 = (target - nw) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw] = r
     return canvas
 
 
@@ -34,13 +35,13 @@ def _pca_upright(gray, mask):
     angle = math.degrees(math.atan2(major[1], major[0]))
     rot = 90 - angle
     h, w = gray.shape[:2]
-    M = cv2.getRotationMatrix2D((w//2, h//2), rot, 1.0)
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), rot, 1.0)
     gray = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)
     mask = cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
     ys, xs = np.where(mask > 0)
     if len(xs) >= 10:
-        x0, x1 = max(0, xs.min()-2), min(w, xs.max()+3)
-        y0, y1 = max(0, ys.min()-2), min(h, ys.max()+3)
+        x0, x1 = max(0, xs.min() - 2), min(w, xs.max() + 3)
+        y0, y1 = max(0, ys.min() - 2), min(h, ys.max() + 3)
         gray = gray[y0:y1, x0:x1]
         mask = mask[y0:y1, x0:x1]
     return gray, mask
@@ -48,44 +49,53 @@ def _pca_upright(gray, mask):
 
 class ORBSignRecognizer:
     """
-    ORB (primary) + template correlation + edge/corner similarity + temporal stability.
-    Loads every image in references_path as a label (filename stem).
+    Hybrid recognizer combining geometric features (finger counting) + ORB matching.
+    Much more robust than pure ORB.
     """
 
     def __init__(self, references_path):
         self.references_path = references_path
 
         # ORB (no contrib)
-        self.orb = cv2.ORB_create(nfeatures=1000, scaleFactor=1.2, nlevels=8, edgeThreshold=15,
+        self.orb = cv2.ORB_create(nfeatures=1500, scaleFactor=1.2, nlevels=8, edgeThreshold=15,
                                   firstLevel=0, WTA_K=2, scoreType=cv2.ORB_HARRIS_SCORE,
                                   patchSize=31, fastThreshold=20)
-        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         self.ratio = 0.75
 
-        # Stability (auto-tuned via calibration)
-        self.history = deque(maxlen=10)
-        self.stability_freq = 0.70
-        self.stability_conf = 0.60
+        # Stability - more lenient like your friend's
+        self.prediction_buffer = deque(maxlen=30)
+        self.confidence_buffer = deque(maxlen=30)
+        self.geometric_buffer = deque(maxlen=30)
+        self.orb_buffer = deque(maxlen=30)
 
-        # refs: label -> features
+        self.current_prediction = None
+        self.current_confidence = 0.0
+        self.frames_stable = 0
+        self.min_stable_frames = 15
+
+        # Templates: label -> {geometric, orb_features}
         self.refs = {}
         self._load_refs()
 
-    # ----- calibration tuning -----
+    # ----- Calibration -----
     def set_stability(self, window=None, freq=None, conf=None):
-        if window is not None and window != self.history.maxlen:
-            self.history = deque(self.history, maxlen=int(window))
-        if freq is not None:
-            self.stability_freq = float(freq)
-        if conf is not None:
-            self.stability_conf = float(conf)
+        if window is not None:
+            new_len = int(window)
+            self.prediction_buffer = deque(self.prediction_buffer, maxlen=new_len)
+            self.confidence_buffer = deque(self.confidence_buffer, maxlen=new_len)
 
     def get_stability(self):
-        return {"window": self.history.maxlen, "freq": self.stability_freq, "conf": self.stability_conf}
+        return {"window": len(self.prediction_buffer), "freq": 0.51, "conf": 0.45}
 
-    # ----- public -----
     def reset_history(self):
-        self.history.clear()
+        self.prediction_buffer.clear()
+        self.confidence_buffer.clear()
+        self.geometric_buffer.clear()
+        self.orb_buffer.clear()
+        self.current_prediction = None
+        self.current_confidence = 0.0
+        self.frames_stable = 0
 
     def export_normalized_roi(self, roi_bgr, roi_mask=None):
         if roi_bgr is None or roi_bgr.size == 0:
@@ -93,77 +103,130 @@ class ORBSignRecognizer:
         gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
         m = roi_mask if roi_mask is not None else np.ones_like(gray, np.uint8) * 255
         g, m = self._normalize(gray, m)
-        out = g.copy(); out[m == 0] = 0
+        out = g.copy()
+        out[m == 0] = 0
         return _resize_pad(out, 200)
 
-    def predict(self, roi_bgr, roi_mask):
-        if roi_bgr is None or roi_bgr.size == 0 or not self.refs:
-            self._push(None, 0.0); return None, 0.0, False, {}
-        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-        mask = roi_mask if roi_mask is not None else np.ones_like(gray, np.uint8) * 255
-        g, m = self._normalize(gray, mask)
-        if g.size == 0 or np.count_nonzero(m) < 30:
-            self._push(None, 0.0); return None, 0.0, False, {}
+    # ----- Geometric Features (Finger Counting) -----
+    def _extract_geometric_features(self, mask):
+        """Extract geometric features including finger counting"""
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
 
-        # Features
-        kps, des = self.orb.detectAndCompute(g, m)
+        contour = max(contours, key=cv2.contourArea)
+        if len(contour) < 10:
+            return None
 
-        # Scores against all references
-        best_label, best_score = None, -1.0
-        second_score = -1.0
+        features = {}
 
-        for label, R in self.refs.items():
-            s_orb = self._orb_score(des, R['des'])
-            s_tm = self._template_score(g, R['tmpl'])
-            s_edge = self._count_similarity(self._edge_count(g, m), R['edge_count'])
-            s_corner = self._count_similarity(self._corner_count(g, m), R['corner_count'])
-            combined = 0.40*s_orb + 0.25*s_tm + 0.20*s_edge + 0.15*s_corner
+        # Basic shape
+        area = cv2.contourArea(contour)
+        perimeter = cv2.arcLength(contour, True)
+        features['area'] = area
+        features['perimeter'] = perimeter
+        features['compactness'] = (perimeter ** 2) / (4 * np.pi * area) if area > 0 else 0
 
-            if combined > best_score:
-                second_score = best_score
-                best_score = combined
-                best_label = label
-            elif combined > second_score:
-                second_score = combined
+        # Bounding box
+        x, y, w, h = cv2.boundingRect(contour)
+        features['aspect_ratio'] = float(w) / h if h > 0 else 0
+        features['extent'] = area / (w * h) if (w * h) > 0 else 0
 
-        margin = max(0.0, best_score - max(0.0, second_score))
-        conf = float(np.clip(0.75*best_score + 0.25*min(1.0, margin/0.2), 0.0, 1.0))
+        # Hu Moments
+        moments = cv2.moments(contour)
+        hu_moments = cv2.HuMoments(moments)
+        hu_moments = -np.sign(hu_moments) * np.log10(np.abs(hu_moments) + 1e-10)
+        for i, hu in enumerate(hu_moments.flatten()):
+            features[f'hu_{i}'] = hu
 
-        self._push(best_label, conf)
-        ready = self._stable(best_label)
-        return best_label, conf, ready, {}
+        # FINGER COUNTING via convexity defects
+        hull = cv2.convexHull(contour, returnPoints=False)
+        if len(hull) > 3 and len(contour) > hull.max():
+            defects = cv2.convexityDefects(contour, hull)
 
-    # ----- refs -----
-    def _load_refs(self):
-        if not os.path.isdir(self.references_path):
-            print(f"[Recognizer] references path not found: {self.references_path}")
-            return
-        exts = (".png", ".jpg", ".jpeg", ".bmp")
-        loaded = 0
-        for f in os.listdir(self.references_path):
-            if os.path.splitext(f)[1].lower() not in exts:
-                continue
-            label = os.path.splitext(f)[0].upper()
-            img = cv2.imread(os.path.join(self.references_path, f), cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                continue
-            # normalize ref
-            m = (img > 0).astype(np.uint8) * 255 if np.count_nonzero(img) > 0 else \
-                cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-            img, m = _pca_upright(img, m)
-            img = _resize_pad(_clahe(img), 200); m = _resize_pad(m, 200)
-            kps, des = self.orb.detectAndCompute(img, m)
-            R = {
-                "tmpl": img,
-                "des": des,
-                "edge_count": self._edge_count(img, m),
-                "corner_count": self._corner_count(img, m),
-            }
-            self.refs[label] = R
-            loaded += 1
-        print(f"[Recognizer] loaded {loaded} reference(s) from {self.references_path}")
+            if defects is not None:
+                finger_count = 0
+                defect_depths = []
 
-    # ----- internals -----
+                for i in range(defects.shape[0]):
+                    s, e, f, d = defects[i, 0]
+                    start = tuple(contour[s][0])
+                    end = tuple(contour[e][0])
+                    far = tuple(contour[f][0])
+
+                    a = np.linalg.norm(np.array(start) - np.array(far))
+                    b = np.linalg.norm(np.array(end) - np.array(far))
+                    c = np.linalg.norm(np.array(start) - np.array(end))
+
+                    if a > 0 and b > 0:
+                        angle = np.arccos((a ** 2 + b ** 2 - c ** 2) / (2 * a * b))
+                        if angle <= np.pi / 2 and d > 1000:
+                            finger_count += 1
+                            defect_depths.append(d)
+
+                features['finger_count'] = finger_count + 1 if finger_count > 0 else 0
+                features['avg_defect_depth'] = np.mean(defect_depths) if defect_depths else 0
+            else:
+                features['finger_count'] = 0
+                features['avg_defect_depth'] = 0
+        else:
+            features['finger_count'] = 0
+            features['avg_defect_depth'] = 0
+
+        # Solidity
+        hull_points = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull_points)
+        features['solidity'] = area / hull_area if hull_area > 0 else 0
+
+        # Vertices
+        epsilon = 0.01 * perimeter
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        features['vertices'] = len(approx)
+
+        return features
+
+    def _compare_geometric_features(self, features1, features2):
+        """Compare geometric features with finger counting priority"""
+        if features1 is None or features2 is None:
+            return 0.0
+
+        weights = {
+            'finger_count': 4.0,  # CRITICAL for hand signs
+            'solidity': 2.5,
+            'aspect_ratio': 2.0,
+            'compactness': 1.5,
+            'vertices': 1.5,
+            'extent': 1.0,
+        }
+
+        # Add Hu moments
+        for i in range(7):
+            weights[f'hu_{i}'] = 0.6
+
+        total_score = 0.0
+        total_weight = 0.0
+
+        for key in features1.keys():
+            if key in features2 and key in weights:
+                val1 = features1[key]
+                val2 = features2[key]
+
+                if key == 'finger_count':
+                    # Exact match required for fingers
+                    diff = 0.0 if val1 == val2 else 1.0
+                elif key.startswith('hu_'):
+                    max_val = max(abs(val1), abs(val2), 1e-10)
+                    diff = abs(val1 - val2) / max_val
+                else:
+                    diff = abs(val1 - val2) / (abs(val1) + abs(val2) + 1e-10)
+
+                similarity = 1.0 - min(diff, 1.0)
+                total_score += similarity * weights[key]
+                total_weight += weights[key]
+
+        return total_score / total_weight if total_weight > 0 else 0.0
+
+    # ----- ORB Features -----
     def _normalize(self, gray, mask):
         gray = _clahe(gray)
         gray, mask = _pca_upright(gray, mask)
@@ -176,17 +239,140 @@ class ORBSignRecognizer:
         if des_q is None or des_r is None or len(des_q) < 2 or len(des_r) < 2:
             return 0.0
         try:
-            matches = self.matcher.knnMatch(des_q, des_r, k=2)
+            matches = self.matcher.match(des_r, des_q)
         except cv2.error:
             return 0.0
-        good = 0
-        for pair in matches:
-            if len(pair) != 2: continue
-            m, n = pair
-            if m.distance < self.ratio * n.distance:
-                good += 1
-        # cap/normalize
-        return min(good / 50.0, 1.0)
+        if not matches:
+            return 0.0
+
+        distances = [m.distance for m in matches]
+        avg_distance = np.mean(distances)
+        score = 1 / (avg_distance + 1e-6)
+        confidence = min(score / 0.05, 1.0)
+        return confidence
+
+    # ----- Load Templates -----
+    def _load_refs(self):
+        if not os.path.isdir(self.references_path):
+            print(f"[Recognizer] references path not found: {self.references_path}")
+            return
+
+        exts = (".png", ".jpg", ".jpeg", ".bmp")
+        loaded = 0
+
+        for f in os.listdir(self.references_path):
+            if os.path.splitext(f)[1].lower() not in exts:
+                continue
+
+            label = os.path.splitext(f)[0].upper()
+            img = cv2.imread(os.path.join(self.references_path, f), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                continue
+
+            # Extract mask
+            m = (img > 0).astype(np.uint8) * 255 if np.count_nonzero(img) > 0 else \
+                cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+            # Geometric features
+            geometric_features = self._extract_geometric_features(m)
+
+            # ORB features
+            img, m = _pca_upright(img, m)
+            img = _resize_pad(_clahe(img), 200)
+            m = _resize_pad(m, 200)
+            kps, des = self.orb.detectAndCompute(img, m)
+
+            if geometric_features and des is not None and len(kps) > 10:
+                self.refs[label] = {
+                    "tmpl": img,
+                    "des": des,
+                    "geometric": geometric_features,
+                }
+                finger_count = geometric_features.get('finger_count', 0)
+                print(f"[Recognizer] Loaded: {label} (fingers: {finger_count}, keypoints: {len(kps)})")
+                loaded += 1
+            else:
+                print(f"[Recognizer] Skipped {label}: insufficient features")
+
+        print(f"[Recognizer] Total loaded: {loaded} reference(s)")
+
+    # ----- HYBRID PREDICTION -----
+    def predict(self, roi_bgr, roi_mask):
+        if roi_bgr is None or roi_bgr.size == 0 or not self.refs:
+            return self.current_prediction, self.current_confidence, False, {}
+
+        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+        mask = roi_mask if roi_mask is not None else np.ones_like(gray, np.uint8) * 255
+
+        # Extract features
+        query_geometric = self._extract_geometric_features(mask)
+        g, m = self._normalize(gray, mask)
+
+        if g.size == 0 or np.count_nonzero(m) < 30:
+            return self.current_prediction, self.current_confidence, False, {}
+
+        kps, des = self.orb.detectAndCompute(g, m)
+
+        # === GEOMETRIC MATCHING ===
+        geometric_scores = {}
+        if query_geometric:
+            for label, data in self.refs.items():
+                score = self._compare_geometric_features(query_geometric, data["geometric"])
+                geometric_scores[label] = score
+
+        # === ORB MATCHING ===
+        orb_scores = {}
+        if des is not None and len(kps) >= 10:
+            for label, data in self.refs.items():
+                score = self._orb_score(des, data["des"])
+                orb_scores[label] = score
+
+        # === FUSION: 50% Geometric + 50% ORB ===
+        combined_scores = {}
+        for label in self.refs.keys():
+            geo_score = geometric_scores.get(label, 0.0)
+            orb_score = orb_scores.get(label, 0.0)
+            combined_scores[label] = 0.5 * geo_score + 0.5 * orb_score
+
+        # Find best match
+        if combined_scores:
+            best_label = max(combined_scores, key=combined_scores.get)
+            best_score = combined_scores[best_label]
+        else:
+            best_label = None
+            best_score = 0.0
+
+        # === STABILIZATION (like your friend's) ===
+        if best_score > 0.45:  # Lower threshold
+            self.prediction_buffer.append(best_label)
+            self.confidence_buffer.append(best_score)
+            self.geometric_buffer.append(geometric_scores.get(best_label, 0.0))
+            self.orb_buffer.append(orb_scores.get(best_label, 0.0))
+
+        # Require consistent prediction (51% agreement)
+        if len(self.prediction_buffer) >= 10:
+            counts = Counter(self.prediction_buffer)
+            most_common_label, most_common_count = counts.most_common(1)[0]
+            stability = most_common_count / len(self.prediction_buffer)
+
+            if stability >= 0.51:
+                avg_confidence = np.mean([self.confidence_buffer[i] for i, pred in
+                                          enumerate(self.prediction_buffer) if pred == most_common_label])
+
+                if most_common_label == self.current_prediction:
+                    self.frames_stable += 1
+                else:
+                    if avg_confidence > 0.45 or self.frames_stable >= self.min_stable_frames or self.current_prediction is None:
+                        self.current_prediction = most_common_label
+                        self.current_confidence = avg_confidence
+                        self.frames_stable = 0
+            else:
+                self.frames_stable = max(0, self.frames_stable - 1)
+
+        # Check if stable enough to type
+        is_stable = self.frames_stable >= self.min_stable_frames
+
+        return self.current_prediction, self.current_confidence, is_stable, {}
 
     @staticmethod
     def _template_score(g1, g2):
@@ -212,19 +398,8 @@ class ORBSignRecognizer:
         dst = cv2.dilate(dst, None)
         return int(np.sum(dst > 0.01 * max(dst.max(), 1e-6)))
 
-    def _push(self, letter, conf):
-        self.history.append((letter, float(conf)))
-
-    def _stable(self, letter):
-        if len(self.history) < self.history.maxlen:
-            return False
-        counts = {}
-        conf_sum = {}
-        for ltr, c in self.history:
-            if ltr is None: continue
-            counts[ltr] = counts.get(ltr, 0) + 1
-            conf_sum[ltr] = conf_sum.get(ltr, 0.0) + c
-        if letter not in counts: return False
-        freq = counts[letter] / float(len(self.history))
-        mean_conf = conf_sum[letter] / max(1, counts[letter])
-        return (freq >= self.stability_freq) and (mean_conf >= self.stability_conf)
+    @staticmethod
+    def _count_similarity(c1, c2):
+        diff = abs(c1 - c2)
+        mx = max(c1, c2, 1)
+        return 1.0 - min(diff / mx, 1.0)

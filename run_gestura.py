@@ -21,22 +21,91 @@ def draw_fps(frame, fps):
 
 def draw_confidence_bar(frame, conf, x=12, y=88, width=200, height=15):
     """Draw confidence bar visualization"""
-    # Background
     cv2.rectangle(frame, (x, y), (x + width, y + height), (50, 50, 50), -1)
-    # Confidence fill
     fill_width = int(width * conf)
     if conf > 0.7:
-        color = (0, 255, 0)  # Green
+        color = (0, 255, 0)
     elif conf > 0.5:
-        color = (0, 165, 255)  # Orange
+        color = (0, 165, 255)
     else:
-        color = (0, 0, 255)  # Red
+        color = (0, 0, 255)
     cv2.rectangle(frame, (x, y), (x + fill_width, y + height), color, -1)
-    # Border
     cv2.rectangle(frame, (x, y), (x + width, y + height), (255, 255, 255), 1)
-    # Text
     cv2.putText(frame, f"{int(conf * 100)}%", (x + width + 10, y + 12),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+
+def draw_hand_guide_box(frame, hand=None):
+    """Draw guide box showing where to place hand"""
+    h, w = frame.shape[:2]
+
+    # Calculate box position (center-right area)
+    box_size = 280
+    box_x = w - box_size - 80
+    box_y = (h - box_size) // 2
+
+    # Determine box color
+    if hand:
+        x0, y0, x1, y1 = hand["bbox"]
+        hand_center_x = (x0 + x1) // 2
+        hand_center_y = (y0 + y1) // 2
+
+        # Check if hand is inside guide box
+        in_box_x = box_x < hand_center_x < box_x + box_size
+        in_box_y = box_y < hand_center_y < box_y + box_size
+
+        if in_box_x and in_box_y:
+            color = (0, 255, 0)  # Green - good position
+            text = "GOOD POSITION!"
+            text_color = (0, 255, 0)
+        else:
+            color = (0, 165, 255)  # Orange - detected but not in box
+            text = "Move hand into box"
+            text_color = (0, 165, 255)
+    else:
+        color = (0, 0, 255)  # Red - no hand detected
+        text = "Place hand here"
+        text_color = (0, 0, 255)
+
+    # Draw dashed box outline
+    dash_length = 20
+    gap_length = 10
+    thickness = 3
+
+    # Top line
+    for x in range(box_x, box_x + box_size, dash_length + gap_length):
+        cv2.line(frame, (x, box_y), (min(x + dash_length, box_x + box_size), box_y), color, thickness)
+    # Bottom line
+    for x in range(box_x, box_x + box_size, dash_length + gap_length):
+        cv2.line(frame, (x, box_y + box_size), (min(x + dash_length, box_x + box_size), box_y + box_size), color,
+                 thickness)
+    # Left line
+    for y in range(box_y, box_y + box_size, dash_length + gap_length):
+        cv2.line(frame, (box_x, y), (box_x, min(y + dash_length, box_y + box_size)), color, thickness)
+    # Right line
+    for y in range(box_y, box_y + box_size, dash_length + gap_length):
+        cv2.line(frame, (box_x + box_size, y), (box_x + box_size, min(y + dash_length, box_y + box_size)), color,
+                 thickness)
+
+    # Draw hand icon in center
+    icon_size = 60
+    icon_x = box_x + (box_size - icon_size) // 2
+    icon_y = box_y + (box_size - icon_size) // 2
+
+    # Simple hand icon (palm + fingers)
+    cv2.circle(frame, (icon_x + icon_size // 2, icon_y + icon_size // 2), icon_size // 3, color, 2)
+    # Fingers
+    for angle in [0, 30, 60, -30, -60]:
+        rad = np.radians(angle)
+        end_x = int(icon_x + icon_size // 2 + np.cos(rad) * icon_size // 2)
+        end_y = int(icon_y + icon_size // 2 - np.sin(rad) * icon_size // 2)
+        cv2.line(frame, (icon_x + icon_size // 2, icon_y + icon_size // 2), (end_x, end_y), color, 2)
+
+    # Draw instruction text
+    text_x = box_x + box_size // 2 - 80
+    text_y = box_y + box_size + 30
+    cv2.putText(frame, text, (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
 
 
 def main():
@@ -55,6 +124,7 @@ def main():
     show_help = True
     show_mask = False
     capture_mode = False
+    show_guide_box = True  # NEW: Show hand placement guide
 
     # FPS tracking
     fps_counter = 0
@@ -63,7 +133,7 @@ def main():
 
     # Error recovery tracking
     no_hand_counter = 0
-    MAX_NO_HAND = 150  # 5 seconds at 30fps
+    MAX_NO_HAND = 150
 
     # ---- Calibration menu ----
     wiz = CalibrationWizard(cap, hd, rec, resources_path=str(REFS))
@@ -78,10 +148,10 @@ def main():
         cv2.imshow("Calibration", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('1'):
-            wiz.run_simple(target_letter="A", conf_thresh=0.70)
+            wiz.run_simple(target_letter="A", conf_thresh=0.50)
             break
         elif key == ord('2'):
-            res = wiz.run_advanced(letters=("A", "E", "O"), consec=3, base_conf=0.70)
+            res = wiz.run_advanced(letters=("A", "E", "O"), consec=3, base_conf=0.50)
             wiz.show_summary(res)
             break
         elif key == ord('s'):
@@ -91,8 +161,8 @@ def main():
     except:
         pass
 
-    print("\nGestura — Enhanced Final Build")
-    print("Controls: A=Active  H=Help  M=Mask  C=Capture  K=Calibration  Q=Quit\n")
+    print("\nGestura — Hybrid Enhanced Build (Like Your Friend's!)")
+    print("Controls: A=Active  H=Help  M=Mask  G=Guide  C=Capture  K=Calibration  Q=Quit\n")
 
     try:
         while True:
@@ -112,11 +182,11 @@ def main():
             hand = hd.detect_hand(frame)
             candidate, conf, ready = None, 0.0, False
 
-            # Error recovery: reset if no hand for 5 seconds
+            # Error recovery
             if not hand:
                 no_hand_counter += 1
                 if no_hand_counter >= MAX_NO_HAND:
-                    print("[Auto-reset] No hand detected for 5s - resetting detector")
+                    print("[Auto-reset] No hand detected for 5s")
                     hd = HandDetector()
                     rec.reset_history()
                     no_hand_counter = 0
@@ -147,6 +217,11 @@ def main():
 
             # ---- UI overlay ----
             disp = frame.copy()
+
+            # Draw hand guide box
+            if show_guide_box:
+                draw_hand_guide_box(disp, hand)
+
             if hand:
                 cv2.drawContours(disp, [hand["contour"]], -1, (0, 255, 0), 2)
                 x0, y0, x1, y1 = hand["bbox"]
@@ -159,7 +234,6 @@ def main():
             if candidate:
                 cv2.putText(disp, f"Pred: {candidate}", (12, 58),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
-                # Draw confidence bar
                 draw_confidence_bar(disp, conf)
 
             if ready and candidate:
@@ -172,11 +246,12 @@ def main():
             if show_help:
                 help_lines = [
                     "Controls:",
-                    "A - Toggle Active typing",
+                    "A - Toggle typing",
                     "H - Toggle help",
                     "M - Toggle mask",
-                    "C - Capture mode (A..Z to save)",
-                    "K - Calibration menu",
+                    "G - Toggle guide box",
+                    "C - Capture mode",
+                    "K - Calibration",
                     "Q - Quit"
                 ]
                 xh, yh = disp.shape[1] - 340, 26
@@ -184,12 +259,12 @@ def main():
                     cv2.putText(disp, line, (xh, yh + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.5, (230, 230, 230), 1)
 
-            # Draw FPS counter
+            # Draw FPS
             draw_fps(disp, current_fps)
 
             # Movie-style subtitles
             disp = subs.draw(disp)
-            cv2.imshow("Gestura — NSL Keyboard (Enhanced)", disp)
+            cv2.imshow("Gestura — Hybrid (Like Your Friend!)", disp)
 
             if show_mask:
                 if hand:
@@ -202,6 +277,9 @@ def main():
                 break
             elif key == ord('h'):
                 show_help = not show_help
+            elif key == ord('g'):
+                show_guide_box = not show_guide_box
+                print(f"Guide box: {'ON' if show_guide_box else 'OFF'}")
             elif key == ord('m'):
                 show_mask = not show_mask
                 if not show_mask:
@@ -225,10 +303,10 @@ def main():
                     cv2.imshow("Calibration", fr2)
                     k2 = cv2.waitKey(1) & 0xFF
                     if k2 == ord('1'):
-                        wiz.run_simple(target_letter="A", conf_thresh=0.70)
+                        wiz.run_simple(target_letter="A", conf_thresh=0.50)
                         break
                     elif k2 == ord('2'):
-                        res = wiz.run_advanced(letters=("A", "E", "O"), consec=3, base_conf=0.70)
+                        res = wiz.run_advanced(letters=("A", "E", "O"), consec=3, base_conf=0.50)
                         wiz.show_summary(res)
                         break
                     elif k2 == ord('s'):

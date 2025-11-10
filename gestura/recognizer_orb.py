@@ -107,7 +107,7 @@ class ORBSignRecognizer:
         out[m == 0] = 0
         return _resize_pad(out, 200)
 
-    # ----- Geometric Features (Finger Counting) -----
+    # ----- Geometric Features (Finger Counting) WITH ERROR HANDLING -----
     def _extract_geometric_features(self, mask):
         """Extract geometric features including finger counting"""
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -132,56 +132,79 @@ class ORBSignRecognizer:
         features['aspect_ratio'] = float(w) / h if h > 0 else 0
         features['extent'] = area / (w * h) if (w * h) > 0 else 0
 
-        # Hu Moments
-        moments = cv2.moments(contour)
-        hu_moments = cv2.HuMoments(moments)
-        hu_moments = -np.sign(hu_moments) * np.log10(np.abs(hu_moments) + 1e-10)
-        for i, hu in enumerate(hu_moments.flatten()):
-            features[f'hu_{i}'] = hu
+        # Hu Moments with error handling
+        try:
+            moments = cv2.moments(contour)
+            hu_moments = cv2.HuMoments(moments)
+            hu_moments = -np.sign(hu_moments) * np.log10(np.abs(hu_moments) + 1e-10)
+            for i, hu in enumerate(hu_moments.flatten()):
+                features[f'hu_{i}'] = hu
+        except:
+            for i in range(7):
+                features[f'hu_{i}'] = 0.0
 
-        # FINGER COUNTING via convexity defects
-        hull = cv2.convexHull(contour, returnPoints=False)
-        if len(hull) > 3 and len(contour) > hull.max():
-            defects = cv2.convexityDefects(contour, hull)
+        # FINGER COUNTING via convexity defects WITH ERROR HANDLING
+        try:
+            hull = cv2.convexHull(contour, returnPoints=False)
+            if len(hull) > 3 and len(contour) > hull.max():
+                try:
+                    defects = cv2.convexityDefects(contour, hull)
+                except cv2.error:
+                    # Bad contour (self-intersections) - skip finger counting
+                    defects = None
 
-            if defects is not None:
-                finger_count = 0
-                defect_depths = []
+                if defects is not None:
+                    finger_count = 0
+                    defect_depths = []
 
-                for i in range(defects.shape[0]):
-                    s, e, f, d = defects[i, 0]
-                    start = tuple(contour[s][0])
-                    end = tuple(contour[e][0])
-                    far = tuple(contour[f][0])
+                    for i in range(defects.shape[0]):
+                        s, e, f, d = defects[i, 0]
+                        start = tuple(contour[s][0])
+                        end = tuple(contour[e][0])
+                        far = tuple(contour[f][0])
 
-                    a = np.linalg.norm(np.array(start) - np.array(far))
-                    b = np.linalg.norm(np.array(end) - np.array(far))
-                    c = np.linalg.norm(np.array(start) - np.array(end))
+                        a = np.linalg.norm(np.array(start) - np.array(far))
+                        b = np.linalg.norm(np.array(end) - np.array(far))
+                        c = np.linalg.norm(np.array(start) - np.array(end))
 
-                    if a > 0 and b > 0:
-                        angle = np.arccos((a ** 2 + b ** 2 - c ** 2) / (2 * a * b))
-                        if angle <= np.pi / 2 and d > 1000:
-                            finger_count += 1
-                            defect_depths.append(d)
+                        if a > 0 and b > 0:
+                            # Clip to prevent arccos domain error
+                            cos_angle = (a ** 2 + b ** 2 - c ** 2) / (2 * a * b)
+                            cos_angle = np.clip(cos_angle, -1.0, 1.0)
+                            angle = np.arccos(cos_angle)
 
-                features['finger_count'] = finger_count + 1 if finger_count > 0 else 0
-                features['avg_defect_depth'] = np.mean(defect_depths) if defect_depths else 0
+                            if angle <= np.pi / 2 and d > 1000:
+                                finger_count += 1
+                                defect_depths.append(d)
+
+                    features['finger_count'] = finger_count + 1 if finger_count > 0 else 0
+                    features['avg_defect_depth'] = np.mean(defect_depths) if defect_depths else 0
+                else:
+                    features['finger_count'] = 0
+                    features['avg_defect_depth'] = 0
             else:
                 features['finger_count'] = 0
                 features['avg_defect_depth'] = 0
-        else:
+        except Exception as e:
+            # Any error in finger counting - use safe defaults
             features['finger_count'] = 0
             features['avg_defect_depth'] = 0
 
-        # Solidity
-        hull_points = cv2.convexHull(contour)
-        hull_area = cv2.contourArea(hull_points)
-        features['solidity'] = area / hull_area if hull_area > 0 else 0
+        # Solidity with error handling
+        try:
+            hull_points = cv2.convexHull(contour)
+            hull_area = cv2.contourArea(hull_points)
+            features['solidity'] = area / hull_area if hull_area > 0 else 0
+        except:
+            features['solidity'] = 0.0
 
-        # Vertices
-        epsilon = 0.01 * perimeter
-        approx = cv2.approxPolyDP(contour, epsilon, True)
-        features['vertices'] = len(approx)
+        # Vertices with error handling
+        try:
+            epsilon = 0.01 * perimeter
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            features['vertices'] = len(approx)
+        except:
+            features['vertices'] = 0
 
         return features
 

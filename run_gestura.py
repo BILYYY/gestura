@@ -413,7 +413,7 @@ def main():
                                                   offset=(hx0, hy0))
 
                 # Recognize gesture
-                label, c, is_ready, debug_info = rec.predict(hand["roi"], hand["roi_mask"])
+                label, c, is_ready, debug_info = rec.predict(hand["roi"], hand["roi_mask"], skeleton)
                 candidate, conf, ready = label, c, is_ready
 
                 # Matching info for display

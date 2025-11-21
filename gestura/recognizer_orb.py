@@ -62,6 +62,7 @@ class ORBSignRecognizer:
         self.confidence_buffer = deque(maxlen=30)
         self.geometric_buffer = deque(maxlen=30)
         self.orb_buffer = deque(maxlen=30)
+        self.skeleton_buffer = deque(maxlen=30)  # NEW
 
         self.current_prediction = None
         self.current_confidence = 0.0
@@ -85,6 +86,7 @@ class ORBSignRecognizer:
         self.confidence_buffer.clear()
         self.geometric_buffer.clear()
         self.orb_buffer.clear()
+        self.skeleton_buffer.clear()  # NEW
         self.current_prediction = None
         self.current_confidence = 0.0
         self.frames_stable = 0
@@ -227,6 +229,36 @@ class ORBSignRecognizer:
 
         return total_score / total_weight if total_weight > 0 else 0.0
 
+    def _compare_skeleton_features(self, skel1, skel2):
+        """NEW: Compare two skeleton structures (20% weight)"""
+        if skel1 is None or skel2 is None:
+            return 0.0
+
+        # Compare extended finger count (most important)
+        ext1 = skel1.get('extended_count', 0)
+        ext2 = skel2.get('extended_count', 0)
+
+        if ext1 == ext2:
+            finger_score = 1.0
+        elif abs(ext1 - ext2) == 1:
+            finger_score = 0.5  # Close enough
+        else:
+            finger_score = 0.0
+
+        # Compare number of fingertips detected
+        tips1 = len(skel1.get('fingertips', []))
+        tips2 = len(skel2.get('fingertips', []))
+
+        if tips1 == tips2:
+            tips_score = 1.0
+        elif abs(tips1 - tips2) == 1:
+            tips_score = 0.7
+        else:
+            tips_score = 0.0
+
+        # Weighted combination
+        return 0.7 * finger_score + 0.3 * tips_score
+
     def _normalize(self, gray, mask):
         gray = _clahe(gray)
         gray, mask = _pca_upright(gray, mask)
@@ -278,6 +310,7 @@ class ORBSignRecognizer:
             m = _resize_pad(m, 200)
             kps, des = self.orb.detectAndCompute(img, m)
 
+            # NEW: Load skeleton data
             skeleton_data = None
             skeleton_path = os.path.join(self.references_path, f"{label}_skeleton.json")
             if os.path.exists(skeleton_path):
@@ -285,14 +318,14 @@ class ORBSignRecognizer:
                     with open(skeleton_path, 'r', encoding='utf-8') as sf:
                         skeleton_data = json.load(sf)
                 except:
-                    pass
+                    skeleton_data = None
 
             if geometric_features and des is not None and len(kps) > 10:
                 self.refs[label] = {
                     "tmpl": img,
                     "des": des,
                     "geometric": geometric_features,
-                    "skeleton": skeleton_data
+                    "skeleton": skeleton_data  # NEW
                 }
                 finger_count = geometric_features.get('finger_count', 0)
                 skel_info = f", skeleton: {skeleton_data.get('extended_count', '?')}ext" if skeleton_data else ""
@@ -303,7 +336,7 @@ class ORBSignRecognizer:
 
         print(f"[Recognizer] Total loaded: {loaded} reference(s)")
 
-    def predict(self, roi_bgr, roi_mask):
+    def predict(self, roi_bgr, roi_mask, skeleton=None):  # NEW: skeleton parameter
         if roi_bgr is None or roi_bgr.size == 0 or not self.refs:
             return self.current_prediction, self.current_confidence, False, {}
 
@@ -318,23 +351,40 @@ class ORBSignRecognizer:
 
         kps, des = self.orb.detectAndCompute(g, m)
 
+        # Geometric scores
         geometric_scores = {}
         if query_geometric:
             for label, data in self.refs.items():
                 score = self._compare_geometric_features(query_geometric, data["geometric"])
                 geometric_scores[label] = score
 
+        # ORB scores
         orb_scores = {}
         if des is not None and len(kps) >= 10:
             for label, data in self.refs.items():
                 score = self._orb_score(des, data["des"])
                 orb_scores[label] = score
 
+        # NEW: Skeleton scores
+        skeleton_scores = {}
+        if skeleton is not None:
+            for label, data in self.refs.items():
+                ref_skeleton = data.get("skeleton")
+                score = self._compare_skeleton_features(skeleton, ref_skeleton)
+                skeleton_scores[label] = score
+
+        # NEW: 3-way fusion (40% geo, 40% orb, 20% skeleton)
         combined_scores = {}
         for label in self.refs.keys():
             geo_score = geometric_scores.get(label, 0.0)
             orb_score = orb_scores.get(label, 0.0)
-            combined_scores[label] = 0.5 * geo_score + 0.5 * orb_score
+            skel_score = skeleton_scores.get(label, 0.0)
+
+            # If skeleton not available, revert to 50/50
+            if skeleton is None or not skeleton_scores:
+                combined_scores[label] = 0.5 * geo_score + 0.5 * orb_score
+            else:
+                combined_scores[label] = 0.4 * geo_score + 0.4 * orb_score + 0.2 * skel_score
 
         if combined_scores:
             best_label = max(combined_scores, key=combined_scores.get)
@@ -348,6 +398,7 @@ class ORBSignRecognizer:
             self.confidence_buffer.append(best_score)
             self.geometric_buffer.append(geometric_scores.get(best_label, 0.0))
             self.orb_buffer.append(orb_scores.get(best_label, 0.0))
+            self.skeleton_buffer.append(skeleton_scores.get(best_label, 0.0))  # NEW
 
         if len(self.prediction_buffer) >= 10:
             counts = Counter(self.prediction_buffer)

@@ -4,12 +4,60 @@ from collections import deque
 
 
 class SkeletonTracker:
-    def __init__(self, smoothing_frames=15):
+
+
+    def __init__(self, smoothing_frames=15, use_mediapipe=False):
         self.smoothing_frames = smoothing_frames
         self.palm_history = deque(maxlen=smoothing_frames)
         self.fingertips_history = deque(maxlen=smoothing_frames)
 
-    def extract_skeleton(self, mask):
+        # Mode selection
+        self.use_mediapipe = use_mediapipe
+        self.mp_hands = None
+
+        # Try to import MediaPipe if requested
+        if use_mediapipe:
+            try:
+                import mediapipe as mp
+                self.mp_hands = mp.solutions.hands.Hands(
+                    static_image_mode=False,
+                    max_num_hands=1,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5
+                )
+                print("✅ MediaPipe mode enabled")
+            except ImportError:
+                print("⚠️  MediaPipe not installed. Install with: pip install mediapipe")
+                print("   Falling back to CV mode")
+                self.use_mediapipe = False
+
+    def extract_skeleton(self, mask, frame_bgr=None, bbox=None):
+        """
+        Extract hand skeleton from mask.
+
+        Args:
+            mask: Binary hand mask (required for both modes)
+            frame_bgr: Full color frame (required for MediaPipe mode)
+            bbox: Hand bounding box (x0, y0, x1, y1) in frame coordinates (required for MediaPipe)
+
+        Returns:
+            Skeleton dict or None
+        """
+        if self.use_mediapipe and self.mp_hands is not None and frame_bgr is not None and bbox is not None:
+            # Try MediaPipe first
+            skeleton = self._extract_mediapipe(frame_bgr, mask, bbox)
+            if skeleton is not None:
+                return skeleton
+            # If MediaPipe fails, fall back to CV
+            print("⚠️  MediaPipe failed, using CV fallback")
+
+        # Use CV mode (your original algorithm)
+        return self._extract_cv(mask)
+
+    # ==================== CV MODE (YOUR ORIGINAL ALGORITHM) ====================
+
+    def _extract_cv(self, mask):
+        """Original CV-based skeleton extraction (teacher-approved)"""
         if mask is None or mask.size == 0:
             return None
 
@@ -94,7 +142,8 @@ class SkeletonTracker:
         skeleton = {
             "palm_center": (palm_cx / w, palm_cy / h),
             "fingertips": [(fx / w, fy / h) for fx, fy in fingertips_clipped],
-            "mask_size": (w, h)
+            "mask_size": (w, h),
+            "mode": "cv"  # NEW: Track which mode was used
         }
 
         skeleton = self._add_temporal_smoothing(skeleton)
@@ -102,7 +151,80 @@ class SkeletonTracker:
 
         return skeleton
 
+    # ==================== MEDIAPIPE MODE (OPTIONAL ENHANCEMENT) ====================
+
+    def _extract_mediapipe(self, frame_bgr, mask, bbox):
+        """MediaPipe-based skeleton extraction (optional, more accurate)"""
+        if self.mp_hands is None:
+            return None
+
+        frame_h, frame_w = frame_bgr.shape[:2]
+        mask_h, mask_w = mask.shape[:2]
+
+        # Bbox in full frame coordinates
+        x0, y0, x1, y1 = bbox
+        hand_w = x1 - x0
+        hand_h = y1 - y0
+
+        if hand_w <= 0 or hand_h <= 0:
+            return None
+
+        # Convert full frame to RGB for MediaPipe
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        results = self.mp_hands.process(rgb)
+
+        if not results.multi_hand_landmarks:
+            return None
+
+        landmarks = results.multi_hand_landmarks[0]
+
+        # MediaPipe landmarks are normalized (0-1) relative to FULL FRAME
+        # We need to convert them to be relative to the HAND ROI for consistency
+
+        # Palm center (landmark 9 = middle finger base)
+        palm_lm = landmarks.landmark[9]
+        palm_x_frame = palm_lm.x * frame_w  # Pixel in full frame
+        palm_y_frame = palm_lm.y * frame_h
+
+        # Convert to ROI-relative normalized coordinates
+        palm_x_roi = (palm_x_frame - x0) / hand_w
+        palm_y_roi = (palm_y_frame - y0) / hand_h
+
+        # Fingertip landmarks: 4=thumb, 8=index, 12=middle, 16=ring, 20=pinky
+        fingertip_ids = [4, 8, 12, 16, 20]
+        fingertips_roi = []
+
+        for tip_id in fingertip_ids:
+            lm = landmarks.landmark[tip_id]
+            fx_frame = lm.x * frame_w  # Pixel in full frame
+            fy_frame = lm.y * frame_h
+
+            # Convert to ROI-relative normalized coordinates
+            fx_roi = (fx_frame - x0) / hand_w
+            fy_roi = (fy_frame - y0) / hand_h
+
+            fingertips_roi.append((fx_roi, fy_roi))
+
+        # Must have all 5 fingertips
+        if len(fingertips_roi) < 5:
+            return None
+
+        skeleton = {
+            "palm_center": (palm_x_roi, palm_y_roi),
+            "fingertips": fingertips_roi,
+            "mask_size": (hand_w, hand_h),  # Use hand ROI size for drawing
+            "mode": "mediapipe"  # NEW: Track which mode was used
+        }
+
+        skeleton = self._add_temporal_smoothing(skeleton)
+        skeleton = self._analyze_hand(skeleton, mask)
+
+        return skeleton
+
+    # ==================== SHARED HELPER METHODS ====================
+
     def _merge_close_fingertips(self, points, min_distance=20):
+        """Merge fingertips that are too close together"""
         if not points:
             return []
 
@@ -129,6 +251,7 @@ class SkeletonTracker:
         return merged
 
     def _add_temporal_smoothing(self, skeleton):
+        """Temporal smoothing for both modes"""
         palm_rel = skeleton["palm_center"]
         tips_rel = skeleton["fingertips"]
 
@@ -163,6 +286,7 @@ class SkeletonTracker:
         return skeleton
 
     def _analyze_hand(self, skeleton, mask):
+        """Analyze finger states for both modes"""
         palm = np.array(skeleton["palm_center"])
         fingertips = [np.array(f) for f in skeleton["fingertips"]]
 
@@ -198,24 +322,32 @@ class SkeletonTracker:
         skeleton["finger_states"] = finger_states
         skeleton["extended_count"] = extended_count
 
-        if len(fingertips) >= 2:
-            sorted_by_x = sorted(enumerate(fingertips), key=lambda x: x[1][0])
-            leftmost_idx, leftmost = sorted_by_x[0]
-            rightmost_idx, rightmost = sorted_by_x[-1]
+        # Hand type detection (left/right) - only for CV mode
+        if skeleton.get("mode") != "mediapipe":
+            if len(fingertips) >= 2:
+                sorted_by_x = sorted(enumerate(fingertips), key=lambda x: x[1][0])
+                leftmost_idx, leftmost = sorted_by_x[0]
+                rightmost_idx, rightmost = sorted_by_x[-1]
 
-            thumb_candidate = leftmost if abs(leftmost[0] - palm[0]) > abs(rightmost[0] - palm[0]) else rightmost
+                thumb_candidate = leftmost if abs(leftmost[0] - palm[0]) > abs(rightmost[0] - palm[0]) else rightmost
 
-            if thumb_candidate[0] < palm[0]:
-                skeleton["hand_type"] = "right"
+                if thumb_candidate[0] < palm[0]:
+                    skeleton["hand_type"] = "right"
+                else:
+                    skeleton["hand_type"] = "left"
             else:
-                skeleton["hand_type"] = "left"
+                skeleton["hand_type"] = "unknown"
         else:
+            # MediaPipe: don't use left/right (can be inaccurate with flipped camera)
             skeleton["hand_type"] = "unknown"
 
         return skeleton
 
 
+# ==================== DRAWING & EXPORT (UNCHANGED) ====================
+
 def draw_skeleton_overlay(frame, skeleton, box_size, offset=(0, 0)):
+    """Draw skeleton overlay on frame"""
     if skeleton is None:
         return
 
@@ -259,6 +391,7 @@ def draw_skeleton_overlay(frame, skeleton, box_size, offset=(0, 0)):
 
 
 def skeleton_to_json(skeleton):
+    """Convert skeleton to JSON"""
     if skeleton is None:
         return None
 
@@ -267,5 +400,6 @@ def skeleton_to_json(skeleton):
         "fingertips": skeleton["fingertips"],
         "hand_type": skeleton.get("hand_type", "unknown"),
         "extended_count": skeleton.get("extended_count", 0),
-        "finger_states": skeleton.get("finger_states", [])
+        "finger_states": skeleton.get("finger_states", []),
+        "mode": skeleton.get("mode", "cv")  # NEW: Include mode in JSON
     }

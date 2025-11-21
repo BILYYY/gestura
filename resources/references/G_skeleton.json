@@ -1,0 +1,22 @@
+{
+  "palm_center": [
+    0.7138068258458771,
+    0.1914731952391316
+  ],
+  "fingertips": [
+    [
+      0.38407400502593053,
+      0.1400969609757769
+    ]
+  ],
+  "hand_type": "unknown",
+  "extended_count": 0,
+  "finger_states": [
+    {
+      "index": 0,
+      "state": "half-bent",
+      "distance_ratio": 1.0
+    }
+  ],
+  "mode": "cv"
+}

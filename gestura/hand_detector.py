@@ -3,12 +3,9 @@ import numpy as np
 
 
 class HandDetector:
-
-
     def __init__(self):
-        # WIDER ranges - more tolerant
-        self.lower_skin = np.array([0, 20, 50], dtype=np.uint8)  # Wider!
-        self.upper_skin = np.array([30, 255, 255], dtype=np.uint8)  # Wider!
+        self.lower_skin = np.array([0, 20, 50], dtype=np.uint8)
+        self.upper_skin = np.array([30, 255, 255], dtype=np.uint8)
 
         self.min_area_frac = 0.006
         self.max_area_frac = 0.55
@@ -17,7 +14,6 @@ class HandDetector:
         self.guide_box_size = 280
         self.guide_box_enabled = True
 
-        # NEW: Store if we've calibrated
         self.is_calibrated = False
         self.calibrated_ranges = None
 
@@ -35,13 +31,11 @@ class HandDetector:
         return box_x, box_y, box_x + box_size, box_y + box_size
 
     def calibrate_from_roi(self, roi_bgr, roi_mask, pad_h=15, pad_s=30, pad_v=40):
-        """WIDER calibration tolerances for lighting changes"""
         if roi_bgr is None or roi_mask is None:
             return False
         if roi_bgr.size == 0 or roi_mask.size == 0:
             return False
 
-        # Apply auto-adjust BEFORE calibrating (so we calibrate on adjusted image)
         roi_bgr = self._auto_adjust_brightness(roi_bgr)
 
         hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
@@ -53,28 +47,24 @@ class HandDetector:
         S = hsv[..., 1][m].astype(np.int32)
         V = hsv[..., 2][m].astype(np.int32)
 
-        h_lo, h_hi = np.percentile(H, [10, 90]).astype(int)  # Less extreme
+        h_lo, h_hi = np.percentile(H, [10, 90]).astype(int)
         s_lo, s_hi = np.percentile(S, [10, 90]).astype(int)
         v_lo, v_hi = np.percentile(V, [10, 90]).astype(int)
 
-        # MUCH WIDER padding for lighting tolerance
         lower = [max(0, h_lo - pad_h), max(0, s_lo - pad_s), max(0, v_lo - pad_v)]
         upper = [min(179, h_hi + pad_h), min(255, s_hi + pad_s), min(255, v_hi + pad_v)]
 
-        # Store calibrated ranges
         self.calibrated_ranges = (lower, upper)
         self.is_calibrated = True
 
         self.set_skin_hsv(lower, upper)
-        print(f"[Calibration] HSV range: {lower} to {upper}")
+        print(f"[HandDetector] Calibrated HSV: {lower} to {upper}")
         return True
 
     def _auto_adjust_brightness(self, frame_bgr):
-        """CONSISTENT auto-adjustment for all frames"""
         lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
 
-        # Stronger adjustment for more lighting tolerance
         clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
         l = clahe.apply(l)
 
@@ -94,30 +84,24 @@ class HandDetector:
         return mask
 
     def _skin_mask(self, frame_bgr):
-        # ALWAYS auto-adjust (consistent with calibration)
         frame_bgr = self._auto_adjust_brightness(frame_bgr)
 
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
-        # Use calibrated ranges if available, otherwise use defaults
         if self.is_calibrated and self.calibrated_ranges:
             lower, upper = self.calibrated_ranges
-            # Add even MORE tolerance at runtime
             lower_adjusted = [max(0, lower[0] - 5), max(0, lower[1] - 10), max(0, lower[2] - 15)]
             upper_adjusted = [min(179, upper[0] + 5), min(255, upper[1] + 10), min(255, upper[2] + 15)]
             mask = cv2.inRange(hsv, np.array(lower_adjusted, dtype=np.uint8),
                                np.array(upper_adjusted, dtype=np.uint8))
         else:
-            # Uncalibrated - use very wide defaults
             mask = cv2.inRange(hsv, self.lower_skin, self.upper_skin)
 
-        # Aggressive morphology for robustness
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel, iterations=3)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel, iterations=3)
         mask = cv2.GaussianBlur(mask, (7, 7), 0)
         mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
 
-        # Apply box mask
         box_mask = self._create_box_mask(frame_bgr.shape)
         mask = cv2.bitwise_and(mask, mask, mask=box_mask)
 
@@ -152,7 +136,10 @@ class HandDetector:
         if roi.size == 0 or roi_mask.size == 0:
             return None
         return {
-            "mask": mask, "contour": contour,
-            "roi": roi, "roi_mask": roi_mask,
-            "bbox": bbox, "area": area
+            "mask": mask,
+            "contour": contour,
+            "roi": roi,
+            "roi_mask": roi_mask,
+            "bbox": bbox,
+            "area": area
         }

@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 from collections import deque, Counter
 import math
+import json
 
 
 def _clahe(gray):
@@ -48,22 +49,15 @@ def _pca_upright(gray, mask):
 
 
 class ORBSignRecognizer:
-    """
-    Hybrid recognizer combining geometric features (finger counting) + ORB matching.
-    Much more robust than pure ORB.
-    """
-
     def __init__(self, references_path):
         self.references_path = references_path
 
-        # ORB (no contrib)
         self.orb = cv2.ORB_create(nfeatures=1500, scaleFactor=1.2, nlevels=8, edgeThreshold=15,
                                   firstLevel=0, WTA_K=2, scoreType=cv2.ORB_HARRIS_SCORE,
                                   patchSize=31, fastThreshold=20)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         self.ratio = 0.75
 
-        # Stability - more lenient like your friend's
         self.prediction_buffer = deque(maxlen=30)
         self.confidence_buffer = deque(maxlen=30)
         self.geometric_buffer = deque(maxlen=30)
@@ -74,11 +68,9 @@ class ORBSignRecognizer:
         self.frames_stable = 0
         self.min_stable_frames = 15
 
-        # Templates: label -> {geometric, orb_features}
         self.refs = {}
         self._load_refs()
 
-    # ----- Calibration -----
     def set_stability(self, window=None, freq=None, conf=None):
         if window is not None:
             new_len = int(window)
@@ -107,9 +99,7 @@ class ORBSignRecognizer:
         out[m == 0] = 0
         return _resize_pad(out, 200)
 
-    # ----- Geometric Features (Finger Counting) WITH ERROR HANDLING -----
     def _extract_geometric_features(self, mask):
-        """Extract geometric features including finger counting"""
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None
@@ -120,19 +110,16 @@ class ORBSignRecognizer:
 
         features = {}
 
-        # Basic shape
         area = cv2.contourArea(contour)
         perimeter = cv2.arcLength(contour, True)
         features['area'] = area
         features['perimeter'] = perimeter
         features['compactness'] = (perimeter ** 2) / (4 * np.pi * area) if area > 0 else 0
 
-        # Bounding box
         x, y, w, h = cv2.boundingRect(contour)
         features['aspect_ratio'] = float(w) / h if h > 0 else 0
         features['extent'] = area / (w * h) if (w * h) > 0 else 0
 
-        # Hu Moments with error handling
         try:
             moments = cv2.moments(contour)
             hu_moments = cv2.HuMoments(moments)
@@ -143,14 +130,12 @@ class ORBSignRecognizer:
             for i in range(7):
                 features[f'hu_{i}'] = 0.0
 
-        # FINGER COUNTING via convexity defects WITH ERROR HANDLING
         try:
             hull = cv2.convexHull(contour, returnPoints=False)
             if len(hull) > 3 and len(contour) > hull.max():
                 try:
                     defects = cv2.convexityDefects(contour, hull)
                 except cv2.error:
-                    # Bad contour (self-intersections) - skip finger counting
                     defects = None
 
                 if defects is not None:
@@ -168,7 +153,6 @@ class ORBSignRecognizer:
                         c = np.linalg.norm(np.array(start) - np.array(end))
 
                         if a > 0 and b > 0:
-                            # Clip to prevent arccos domain error
                             cos_angle = (a ** 2 + b ** 2 - c ** 2) / (2 * a * b)
                             cos_angle = np.clip(cos_angle, -1.0, 1.0)
                             angle = np.arccos(cos_angle)
@@ -186,11 +170,9 @@ class ORBSignRecognizer:
                 features['finger_count'] = 0
                 features['avg_defect_depth'] = 0
         except Exception as e:
-            # Any error in finger counting - use safe defaults
             features['finger_count'] = 0
             features['avg_defect_depth'] = 0
 
-        # Solidity with error handling
         try:
             hull_points = cv2.convexHull(contour)
             hull_area = cv2.contourArea(hull_points)
@@ -198,7 +180,6 @@ class ORBSignRecognizer:
         except:
             features['solidity'] = 0.0
 
-        # Vertices with error handling
         try:
             epsilon = 0.01 * perimeter
             approx = cv2.approxPolyDP(contour, epsilon, True)
@@ -209,12 +190,11 @@ class ORBSignRecognizer:
         return features
 
     def _compare_geometric_features(self, features1, features2):
-        """Compare geometric features with finger counting priority"""
         if features1 is None or features2 is None:
             return 0.0
 
         weights = {
-            'finger_count': 4.0,  # CRITICAL for hand signs
+            'finger_count': 4.0,
             'solidity': 2.5,
             'aspect_ratio': 2.0,
             'compactness': 1.5,
@@ -222,7 +202,6 @@ class ORBSignRecognizer:
             'extent': 1.0,
         }
 
-        # Add Hu moments
         for i in range(7):
             weights[f'hu_{i}'] = 0.6
 
@@ -235,7 +214,6 @@ class ORBSignRecognizer:
                 val2 = features2[key]
 
                 if key == 'finger_count':
-                    # Exact match required for fingers
                     diff = 0.0 if val1 == val2 else 1.0
                 elif key.startswith('hu_'):
                     max_val = max(abs(val1), abs(val2), 1e-10)
@@ -249,7 +227,6 @@ class ORBSignRecognizer:
 
         return total_score / total_weight if total_weight > 0 else 0.0
 
-    # ----- ORB Features -----
     def _normalize(self, gray, mask):
         gray = _clahe(gray)
         gray, mask = _pca_upright(gray, mask)
@@ -274,7 +251,6 @@ class ORBSignRecognizer:
         confidence = min(score / 0.05, 1.0)
         return confidence
 
-    # ----- Load Templates -----
     def _load_refs(self):
         if not os.path.isdir(self.references_path):
             print(f"[Recognizer] references path not found: {self.references_path}")
@@ -292,34 +268,41 @@ class ORBSignRecognizer:
             if img is None:
                 continue
 
-            # Extract mask
             m = (img > 0).astype(np.uint8) * 255 if np.count_nonzero(img) > 0 else \
                 cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
 
-            # Geometric features
             geometric_features = self._extract_geometric_features(m)
 
-            # ORB features
             img, m = _pca_upright(img, m)
             img = _resize_pad(_clahe(img), 200)
             m = _resize_pad(m, 200)
             kps, des = self.orb.detectAndCompute(img, m)
+
+            skeleton_data = None
+            skeleton_path = os.path.join(self.references_path, f"{label}_skeleton.json")
+            if os.path.exists(skeleton_path):
+                try:
+                    with open(skeleton_path, 'r', encoding='utf-8') as sf:
+                        skeleton_data = json.load(sf)
+                except:
+                    pass
 
             if geometric_features and des is not None and len(kps) > 10:
                 self.refs[label] = {
                     "tmpl": img,
                     "des": des,
                     "geometric": geometric_features,
+                    "skeleton": skeleton_data
                 }
                 finger_count = geometric_features.get('finger_count', 0)
-                print(f"[Recognizer] Loaded: {label} (fingers: {finger_count}, keypoints: {len(kps)})")
+                skel_info = f", skeleton: {skeleton_data.get('extended_count', '?')}ext" if skeleton_data else ""
+                print(f"[Recognizer] Loaded: {label} (fingers: {finger_count}, kps: {len(kps)}{skel_info})")
                 loaded += 1
             else:
                 print(f"[Recognizer] Skipped {label}: insufficient features")
 
         print(f"[Recognizer] Total loaded: {loaded} reference(s)")
 
-    # ----- HYBRID PREDICTION -----
     def predict(self, roi_bgr, roi_mask):
         if roi_bgr is None or roi_bgr.size == 0 or not self.refs:
             return self.current_prediction, self.current_confidence, False, {}
@@ -327,7 +310,6 @@ class ORBSignRecognizer:
         gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
         mask = roi_mask if roi_mask is not None else np.ones_like(gray, np.uint8) * 255
 
-        # Extract features
         query_geometric = self._extract_geometric_features(mask)
         g, m = self._normalize(gray, mask)
 
@@ -336,28 +318,24 @@ class ORBSignRecognizer:
 
         kps, des = self.orb.detectAndCompute(g, m)
 
-        # === GEOMETRIC MATCHING ===
         geometric_scores = {}
         if query_geometric:
             for label, data in self.refs.items():
                 score = self._compare_geometric_features(query_geometric, data["geometric"])
                 geometric_scores[label] = score
 
-        # === ORB MATCHING ===
         orb_scores = {}
         if des is not None and len(kps) >= 10:
             for label, data in self.refs.items():
                 score = self._orb_score(des, data["des"])
                 orb_scores[label] = score
 
-        # === FUSION: 50% Geometric + 50% ORB ===
         combined_scores = {}
         for label in self.refs.keys():
             geo_score = geometric_scores.get(label, 0.0)
             orb_score = orb_scores.get(label, 0.0)
             combined_scores[label] = 0.5 * geo_score + 0.5 * orb_score
 
-        # Find best match
         if combined_scores:
             best_label = max(combined_scores, key=combined_scores.get)
             best_score = combined_scores[best_label]
@@ -365,14 +343,12 @@ class ORBSignRecognizer:
             best_label = None
             best_score = 0.0
 
-        # === STABILIZATION (like your friend's) ===
-        if best_score > 0.45:  # Lower threshold
+        if best_score > 0.45:
             self.prediction_buffer.append(best_label)
             self.confidence_buffer.append(best_score)
             self.geometric_buffer.append(geometric_scores.get(best_label, 0.0))
             self.orb_buffer.append(orb_scores.get(best_label, 0.0))
 
-        # Require consistent prediction (51% agreement)
         if len(self.prediction_buffer) >= 10:
             counts = Counter(self.prediction_buffer)
             most_common_label, most_common_count = counts.most_common(1)[0]
@@ -392,37 +368,6 @@ class ORBSignRecognizer:
             else:
                 self.frames_stable = max(0, self.frames_stable - 1)
 
-        # Check if stable enough to type
         is_stable = self.frames_stable >= self.min_stable_frames
 
         return self.current_prediction, self.current_confidence, is_stable, {}
-
-    @staticmethod
-    def _template_score(g1, g2):
-        if g1.shape != g2.shape:
-            return 0.0
-        r = cv2.matchTemplate(g1, g2, cv2.TM_CCOEFF_NORMED)
-        v = float(r[0, 0])
-        return max(0.0, (v + 1.0) / 2.0)
-
-    @staticmethod
-    def _edge_count(gray, mask):
-        blur = cv2.GaussianBlur(gray, (3, 3), 0)
-        edges = cv2.Canny(blur, 50, 150)
-        edges = cv2.bitwise_and(edges, edges, mask=mask)
-        return int(np.sum(edges > 0))
-
-    @staticmethod
-    def _corner_count(gray, mask):
-        if np.count_nonzero(mask) == 0:
-            return 0
-        g32 = np.float32(gray)
-        dst = cv2.cornerHarris(g32, 2, 3, 0.04)
-        dst = cv2.dilate(dst, None)
-        return int(np.sum(dst > 0.01 * max(dst.max(), 1e-6)))
-
-    @staticmethod
-    def _count_similarity(c1, c2):
-        diff = abs(c1 - c2)
-        mx = max(c1, c2, 1)
-        return 1.0 - min(diff / mx, 1.0)

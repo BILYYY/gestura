@@ -2,6 +2,7 @@
 import cv2
 import numpy as np
 import time
+import sys
 
 from gestura.hand_detector import HandDetector
 from gestura.recognizer_orb import ORBSignRecognizer
@@ -9,99 +10,194 @@ from gestura.keyboard_manager import KeyboardManager
 from gestura.calibration import CalibrationWizard
 from gestura.subtitle_manager import SubtitleManager
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
+try:
+    from tools import SkeletonTracker, draw_skeleton_overlay
+
+    SKELETON_AVAILABLE = True
+except:
+    SKELETON_AVAILABLE = False
+    print("[RunGestura] Skeleton module not available")
+
 SPECIAL_TOKENS = {"SPACE", "BACK", "CLEAR"}
 
 
-def draw_fps(frame, fps):
-    """Draw FPS counter"""
+def create_3panel_display(frame, hand, skeleton, quality, status_info):
+    """Create 3-panel layout: Camera | Mask | Info"""
     h, w = frame.shape[:2]
-    cv2.putText(frame, f"FPS: {fps}", (w - 100, h - 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
+    canvas = np.zeros((h + 250, w * 2 + 100, 3), dtype=np.uint8)
 
-def draw_confidence_bar(frame, conf, x=12, y=88, width=200, height=15):
-    """Draw confidence bar visualization"""
-    cv2.rectangle(frame, (x, y), (x + width, y + height), (50, 50, 50), -1)
-    fill_width = int(width * conf)
-    if conf > 0.7:
-        color = (0, 255, 0)
-    elif conf > 0.5:
-        color = (0, 165, 255)
+    canvas[0:h, 0:w] = frame
+
+    if hand and "roi_mask" in hand:
+        mask_display = cv2.cvtColor(hand["roi_mask"], cv2.COLOR_GRAY2BGR)
+        mask_h, mask_w = mask_display.shape[:2]
+
+        target_h = h
+        target_w = int(mask_w * (h / mask_h))
+        mask_resized = cv2.resize(mask_display, (target_w, target_h))
+
+        if target_w > w:
+            mask_resized = mask_resized[:, :w]
+
+        canvas[0:target_h, w:w + mask_resized.shape[1]] = mask_resized
+
+        if skeleton:
+            mask_frame = mask_resized.copy()
+            mask_w_resized, mask_h_resized = skeleton.get("mask_size", (mask_w, mask_h))
+            scale_x = mask_resized.shape[1] / mask_w_resized
+            scale_y = mask_resized.shape[0] / mask_h_resized
+
+            palm_x = int(skeleton["palm_center"][0] * mask_w_resized * scale_x)
+            palm_y = int(skeleton["palm_center"][1] * mask_h_resized * scale_y)
+            cv2.circle(mask_frame, (palm_x, palm_y), 8, (0, 255, 255), -1)
+
+            for fx_rel, fy_rel in skeleton["fingertips"]:
+                fx = int(fx_rel * mask_w_resized * scale_x)
+                fy = int(fy_rel * mask_h_resized * scale_y)
+                cv2.line(mask_frame, (palm_x, palm_y), (fx, fy), (0, 255, 0), 2)
+                cv2.circle(mask_frame, (fx, fy), 6, (255, 0, 255), -1)
+
+            canvas[0:target_h, w:w + mask_resized.shape[1]] = mask_frame
+
+        q_text = f"MASK: {quality:.0f}%"
+        q_color = (0, 255, 0) if quality >= 70 else (0, 165, 255) if quality >= 50 else (0, 0, 255)
+        cv2.putText(canvas, q_text, (w + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, q_color, 2)
     else:
-        color = (0, 0, 255)
-    cv2.rectangle(frame, (x, y), (x + fill_width, y + height), color, -1)
-    cv2.rectangle(frame, (x, y), (x + width, y + height), (255, 255, 255), 1)
-    cv2.putText(frame, f"{int(conf * 100)}%", (x + width + 10, y + 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(canvas, "NO MASK", (w + w // 2 - 50, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 100, 100), 2)
+
+    cv2.rectangle(canvas, (w, 0), (w * 2 - 1, h - 1), (100, 100, 100), 2)
+
+    info_y = h + 20
+    x = 20
+
+    status_text = status_info.get("status", "INACTIVE")
+    status_color = (0, 255, 0) if status_text == "ACTIVE" else (0, 0, 255)
+    cv2.putText(canvas, f"STATUS: {status_text}", (x, info_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+    info_y += 35
+
+    if status_info.get("prediction"):
+        pred = status_info["prediction"]
+        conf = status_info.get("confidence", 0.0)
+        cv2.putText(canvas, f"Prediction: {pred} ({conf:.2f})", (x, info_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+        bar_x = x + 250
+        bar_y = info_y - 15
+        bar_w = 200
+        bar_h = 15
+        cv2.rectangle(canvas, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (50, 50, 50), -1)
+        fill_w = int(bar_w * conf)
+        bar_color = (0, 255, 0) if conf > 0.7 else (0, 165, 255) if conf > 0.5 else (0, 0, 255)
+        cv2.rectangle(canvas, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), bar_color, -1)
+        cv2.rectangle(canvas, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (255, 255, 255), 1)
+    info_y += 30
+
+    if skeleton:
+        num_tips = len(skeleton.get("fingertips", []))
+        extended = skeleton.get("extended_count", 0)
+        hand_type = skeleton.get("hand_type", "?")
+
+        cv2.putText(canvas, f"Skeleton: {num_tips} tips", (x, info_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        x += 170
+        cv2.putText(canvas, f"Extended: {extended}", (x, info_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        x += 150
+        cv2.putText(canvas, f"Hand: {hand_type.upper()}", (x, info_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1)
+    else:
+        cv2.putText(canvas, "Skeleton: NONE", (x, info_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+
+    x = 20
+    info_y += 30
+
+    fps = status_info.get("fps", 0)
+    cv2.putText(canvas, f"FPS: {fps}", (x, info_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+    if status_info.get("ready"):
+        cv2.putText(canvas, "READY TO TYPE!", (canvas.shape[1] - 200, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+    if status_info.get("show_help"):
+        help_lines = [
+            "CONTROLS:",
+            "A - Toggle typing",
+            "H - Toggle help",
+            "M - Toggle mask",
+            "G - Toggle guide",
+            "K - Calibration",
+            "ESC - Quit"
+        ]
+        help_x = canvas.shape[1] - 250
+        help_y = 100
+        for line in help_lines:
+            cv2.putText(canvas, line, (help_x, help_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1)
+            help_y += 22
+
+    return canvas
 
 
 def draw_hand_guide_box(frame, hand=None):
-    """Draw guide box showing where to place hand"""
     h, w = frame.shape[:2]
 
-    # Calculate box position (center-right area)
     box_size = 280
     box_x = w - box_size - 80
     box_y = (h - box_size) // 2
 
-    # Determine box color
     if hand:
         x0, y0, x1, y1 = hand["bbox"]
         hand_center_x = (x0 + x1) // 2
         hand_center_y = (y0 + y1) // 2
 
-        # Check if hand is inside guide box
         in_box_x = box_x < hand_center_x < box_x + box_size
         in_box_y = box_y < hand_center_y < box_y + box_size
 
         if in_box_x and in_box_y:
-            color = (0, 255, 0)  # Green - good position
+            color = (0, 255, 0)
             text = "GOOD POSITION!"
             text_color = (0, 255, 0)
         else:
-            color = (0, 165, 255)  # Orange - detected but not in box
+            color = (0, 165, 255)
             text = "Move hand into box"
             text_color = (0, 165, 255)
     else:
-        color = (0, 0, 255)  # Red - no hand detected
+        color = (0, 0, 255)
         text = "Place hand here"
         text_color = (0, 0, 255)
 
-    # Draw dashed box outline
     dash_length = 20
     gap_length = 10
     thickness = 3
 
-    # Top line
     for x in range(box_x, box_x + box_size, dash_length + gap_length):
         cv2.line(frame, (x, box_y), (min(x + dash_length, box_x + box_size), box_y), color, thickness)
-    # Bottom line
     for x in range(box_x, box_x + box_size, dash_length + gap_length):
         cv2.line(frame, (x, box_y + box_size), (min(x + dash_length, box_x + box_size), box_y + box_size), color,
                  thickness)
-    # Left line
     for y in range(box_y, box_y + box_size, dash_length + gap_length):
         cv2.line(frame, (box_x, y), (box_x, min(y + dash_length, box_y + box_size)), color, thickness)
-    # Right line
     for y in range(box_y, box_y + box_size, dash_length + gap_length):
         cv2.line(frame, (box_x + box_size, y), (box_x + box_size, min(y + dash_length, box_y + box_size)), color,
                  thickness)
 
-    # Draw hand icon in center
     icon_size = 60
     icon_x = box_x + (box_size - icon_size) // 2
     icon_y = box_y + (box_size - icon_size) // 2
 
-    # Simple hand icon (palm + fingers)
     cv2.circle(frame, (icon_x + icon_size // 2, icon_y + icon_size // 2), icon_size // 3, color, 2)
-    # Fingers
     for angle in [0, 30, 60, -30, -60]:
         rad = np.radians(angle)
         end_x = int(icon_x + icon_size // 2 + np.cos(rad) * icon_size // 2)
         end_y = int(icon_y + icon_size // 2 - np.sin(rad) * icon_size // 2)
         cv2.line(frame, (icon_x + icon_size // 2, icon_y + icon_size // 2), (end_x, end_y), color, 2)
 
-    # Draw instruction text
     text_x = box_x + box_size // 2 - 80
     text_y = box_y + box_size + 30
     cv2.putText(frame, text, (text_x, text_y),
@@ -121,23 +217,24 @@ def main():
     kbd = KeyboardManager()
     subs = SubtitleManager()
 
+    if SKELETON_AVAILABLE:
+        skeleton_tracker = SkeletonTracker(smoothing_frames=15)
+    else:
+        skeleton_tracker = None
+
     show_help = True
     show_mask = False
     capture_mode = False
-    show_guide_box = True  # NEW: Show hand placement guide
+    show_guide_box = True
 
-    # FPS tracking
     fps_counter = 0
     fps_start = time.time()
     current_fps = 0
 
-    # Error recovery tracking
     no_hand_counter = 0
     MAX_NO_HAND = 150
 
-    # ---- Calibration menu WITH GUIDE BOX ----
     wiz = CalibrationWizard(cap, hd, rec, resources_path=str(REFS))
-    # IMPORTANT: Enable box for startup calibration menu
     hd.enable_guide_box(True)
 
     while True:
@@ -146,7 +243,6 @@ def main():
             break
         frame = cv2.flip(frame, 1)
 
-        # Draw guide box in calibration menu
         hand_preview = hd.detect_hand(frame)
         draw_hand_guide_box(frame, hand_preview)
 
@@ -169,8 +265,8 @@ def main():
     except:
         pass
 
-    print("\nGestura — Hybrid Enhanced Build (Like Your Friend's!)")
-    print("Controls: A=Active  H=Help  M=Mask  G=Guide  C=Capture  K=Calibration  Q=Quit\n")
+    print("\nGestura — Enhanced with Skeleton!")
+    print("Controls: A=Active  H=Help  G=Guide  K=Calibration  ESC=Quit\n")
 
     try:
         while True:
@@ -180,7 +276,6 @@ def main():
                 break
             frame = cv2.flip(frame, 1)
 
-            # FPS calculation
             fps_counter += 1
             if time.time() - fps_start >= 1.0:
                 current_fps = fps_counter
@@ -189,20 +284,33 @@ def main():
 
             hand = hd.detect_hand(frame)
             candidate, conf, ready = None, 0.0, False
+            skeleton = None
+            quality = 0.0
 
-            # Error recovery
             if not hand:
                 no_hand_counter += 1
                 if no_hand_counter >= MAX_NO_HAND:
                     print("[Auto-reset] No hand detected for 5s")
                     hd = HandDetector()
-                    hd.enable_guide_box(show_guide_box)  # Restore box state
+                    hd.enable_guide_box(show_guide_box)
                     rec.reset_history()
+                    if skeleton_tracker:
+                        skeleton_tracker = SkeletonTracker(smoothing_frames=15)
                     no_hand_counter = 0
             else:
                 no_hand_counter = 0
 
             if hand:
+                if skeleton_tracker and SKELETON_AVAILABLE and "roi_mask" in hand:
+                    skeleton = skeleton_tracker.extract_skeleton(hand["roi_mask"])
+                    quality = np.count_nonzero(hand["roi_mask"]) / hand["roi_mask"].size * 100
+
+                    if skeleton:
+                        hx0, hy0, hx1, hy1 = hand["bbox"]
+                        hand_w = hx1 - hx0
+                        hand_h = hy1 - hy0
+                        draw_skeleton_overlay(frame, skeleton, box_size=(hand_w, hand_h), offset=(hx0, hy0))
+
                 label, c, is_ready, _ = rec.predict(hand["roi"], hand["roi_mask"])
                 candidate, conf, ready = label, c, is_ready
 
@@ -224,91 +332,48 @@ def main():
                         if kbd.is_active():
                             kbd.type_character(lab)
 
-            # ---- UI overlay ----
             disp = frame.copy()
 
-            # Draw hand guide box
             if show_guide_box:
                 draw_hand_guide_box(disp, hand)
 
             if hand:
                 cv2.drawContours(disp, [hand["contour"]], -1, (0, 255, 0), 2)
-                x0, y0, x1, y1 = hand["bbox"]
-                cv2.rectangle(disp, (x0, y0), (x1, y1), (255, 0, 0), 2)
 
-            status_color = (0, 255, 0) if kbd.is_active() else (0, 0, 255)
-            status_text = "ACTIVE" if kbd.is_active() else "INACTIVE (A)"
-            cv2.putText(disp, status_text, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, status_color, 2)
+            status_info = {
+                "status": "ACTIVE" if kbd.is_active() else "INACTIVE",
+                "prediction": candidate,
+                "confidence": conf,
+                "ready": ready,
+                "fps": current_fps,
+                "show_help": show_help
+            }
 
-            if candidate:
-                cv2.putText(disp, f"Pred: {candidate}", (12, 58),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
-                draw_confidence_bar(disp, conf)
+            canvas = create_3panel_display(disp, hand, skeleton, quality, status_info)
 
-            if ready and candidate:
-                cv2.putText(disp, "READY", (disp.shape[1] - 120, 52),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
-            elif hand:
-                cv2.putText(disp, "Hold steady…", (disp.shape[1] - 210, 52),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+            canvas = subs.draw(canvas)
 
-            if show_help:
-                help_lines = [
-                    "Controls:",
-                    "A - Toggle typing",
-                    "H - Toggle help",
-                    "M - Toggle mask",
-                    "G - Toggle guide box",
-                    "C - Capture mode",
-                    "K - Calibration",
-                    "Q - Quit"
-                ]
-                xh, yh = disp.shape[1] - 340, 26
-                for i, line in enumerate(help_lines):
-                    cv2.putText(disp, line, (xh, yh + i * 22), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.5, (230, 230, 230), 1)
-
-            # Draw FPS
-            draw_fps(disp, current_fps)
-
-            # Movie-style subtitles
-            disp = subs.draw(disp)
-            cv2.imshow("Gestura — Hybrid (Like Your Friend!)", disp)
-
-            if show_mask:
-                if hand:
-                    cv2.imshow("Hand Mask", hand["roi_mask"])
-                else:
-                    cv2.imshow("Hand Mask", np.zeros(frame.shape[:2], dtype=np.uint8))
+            cv2.imshow("Gestura — Enhanced", canvas)
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            if key == 27:  # ESC
                 break
             elif key == ord('h'):
                 show_help = not show_help
             elif key == ord('g'):
                 show_guide_box = not show_guide_box
-                hd.enable_guide_box(show_guide_box)  # ← FIX: Sync with detector!
+                hd.enable_guide_box(show_guide_box)
                 print(f"Guide box: {'ON' if show_guide_box else 'OFF'}")
-            elif key == ord('m'):
-                show_mask = not show_mask
-                if not show_mask:
-                    try:
-                        cv2.destroyWindow("Hand Mask")
-                    except:
-                        pass
             elif key == ord('a'):
                 st = kbd.toggle_active()
                 print(f"Typing {'ENABLED' if st else 'DISABLED'}")
             elif key == ord('k'):
-                # Re-open calibration WITH guide box
-                hd.enable_guide_box(True)  # Force enable for calibration
+                hd.enable_guide_box(True)
                 while True:
                     ok2, fr2 = cap.read()
                     if not ok2:
                         break
                     fr2 = cv2.flip(fr2, 1)
-                    # Draw guide box in recalibration menu too
                     hand_preview2 = hd.detect_hand(fr2)
                     draw_hand_guide_box(fr2, hand_preview2)
                     cv2.putText(fr2, "Calibration", (16, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 220, 255), 2)
@@ -328,21 +393,6 @@ def main():
                 hd.enable_guide_box(show_guide_box)
                 try:
                     cv2.destroyWindow("Calibration")
-                except:
-                    pass
-            elif key == ord('c'):
-                capture_mode = not capture_mode
-                print(f"Capture mode: {'ON' if capture_mode else 'OFF'}")
-            elif capture_mode and key not in (255,):
-                try:
-                    ch = chr(key)
-                    if hand and ch.isalpha():
-                        norm = rec.export_normalized_roi(hand["roi"], hand["roi_mask"])
-                        if norm is not None:
-                            REFS.mkdir(parents=True, exist_ok=True)
-                            out = REFS / f"{ch.upper()}.png"
-                            cv2.imwrite(str(out), norm)
-                            print(f"[Capture] Saved {out}")
                 except:
                     pass
 

@@ -1,0 +1,57 @@
+{
+  "palm_center": [
+    0.441067231827062,
+    0.5361192422563977
+  ],
+  "fingertips": [
+    [
+      0.0,
+      0.9959946367141875
+    ],
+    [
+      0.0,
+      0.7014719083505335
+    ],
+    [
+      0.22928571428571434,
+      0.08010726571625146
+    ],
+    [
+      0.7802380952380953,
+      0.09452550600809616
+    ],
+    [
+      0.860952380952381,
+      0.7046761921524076
+    ]
+  ],
+  "hand_type": "right",
+  "extended_count": 1,
+  "finger_states": [
+    {
+      "index": 0,
+      "state": "extended",
+      "distance_ratio": 1.2158923162432596
+    },
+    {
+      "index": 1,
+      "state": "half-bent",
+      "distance_ratio": 0.8988334147720226
+    },
+    {
+      "index": 2,
+      "state": "half-bent",
+      "distance_ratio": 0.9594127059212836
+    },
+    {
+      "index": 3,
+      "state": "half-bent",
+      "distance_ratio": 1.0624990700362442
+    },
+    {
+      "index": 4,
+      "state": "half-bent",
+      "distance_ratio": 0.8633624930271901
+    }
+  ]
+}
